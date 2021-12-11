@@ -4,7 +4,7 @@ import ast
 import json
 import logging
 import uuid
-from typing import Any, Dict, Generator, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, Iterable, List, Mapping, Optional, Tuple, Union
 
 import boto3
 import pandas as pd
@@ -20,6 +20,7 @@ from awswrangler._utils import parse_path
 from awswrangler.opensearch._utils import _get_distribution, _get_version_major
 
 _logger: logging.Logger = logging.getLogger(__name__)
+_logger.setLevel(logging.DEBUG)
 
 _DEFAULT_REFRESH_INTERVAL = "1s"
 
@@ -36,15 +37,20 @@ def _actions_generator(
     index: str,
     doc_type: Optional[str],
     keys_to_write: Optional[List[str]],
-    id_keys: Optional[List[str]],
+    id_keys: Optional[Union[List[str], str]],
+    transform_func: Optional[Callable[[Any], None]] = None,
     bulk_size: int = 10000,
 ) -> Generator[List[Dict[str, Any]], None, None]:
     bulk_chunk_documents = []
     for i, document in enumerate(documents):
         if id_keys:
+            if type(id_keys) == str:
+                id_keys = [id_keys]
             _id = "-".join([str(document[id_key]) for id_key in id_keys])
         else:
             _id = document.get("_id", uuid.uuid4())
+        if transform_func:
+            transform_func(document)
         bulk_chunk_documents.append(
             {
                 "_index": index,
@@ -79,14 +85,21 @@ def _df_doc_generator(df: pd.DataFrame) -> Generator[Dict[str, Any], None, None]
 
     df_iter = df.iterrows()
     for _, document in df_iter:
-        yield {k: _deserialize(v) for k, v in document.items() if notna(v)}
+        yield {k: _deserialize(v) for k, v in document.items() if type(v) in [list] or notna(v)}
 
 
 def _file_line_generator(path: str, is_json: bool = False) -> Generator[Any, None, None]:
     with open(path) as fp:  # pylint: disable=W1514
         for line in fp:
+            if line.strip() == "":
+                continue  # ignore empty lines
             if is_json:
-                yield json.loads(line)
+                try:
+                    yield json.loads(line)
+                except json.decoder.JSONDecodeError as e:
+                    # print("invalid json str:\n%s", line)
+                    _logger.error("invalid json str:\n%s", line)
+                    raise e
             else:
                 yield line.strip()
 
@@ -201,7 +214,7 @@ def create_index(
                 body["mappings"] = {index: mappings}
     if settings:
         body["settings"] = settings
-    if not body:
+    if body == {}:
         body = None  # type: ignore
 
     # ignore 400 cause by IndexAlreadyExistsException when creating an index
@@ -389,6 +402,7 @@ def index_csv(
     }
     pandas_kwargs.update(enforced_pandas_params)
     df = pd.read_csv(path, **pandas_kwargs)
+    # print(len(df.index))
     return index_df(client, df=df, index=index, doc_type=doc_type, **kwargs)
 
 
@@ -430,7 +444,14 @@ def index_df(
     ...     index='sample-index1'
     ... )
     """
-    return index_documents(client=client, documents=_df_doc_generator(df), index=index, doc_type=doc_type, **kwargs)
+    return index_documents(
+        client=client,
+        documents=_df_doc_generator(df),
+        index=index,
+        doc_type=doc_type,
+        _total_documents=len(df.index),
+        **kwargs,
+    )
 
 
 def index_documents(
@@ -440,6 +461,7 @@ def index_documents(
     doc_type: Optional[str] = None,
     keys_to_write: Optional[List[str]] = None,
     id_keys: Optional[List[str]] = None,
+    transform_func: Optional[Callable[[Any], None]] = None,
     ignore_status: Optional[Union[List[Any], Tuple[Any]]] = None,
     bulk_size: int = 1000,
     chunk_size: Optional[int] = 500,
@@ -447,6 +469,7 @@ def index_documents(
     max_retries: Optional[int] = 5,
     initial_backoff: Optional[int] = 2,
     max_backoff: Optional[int] = 600,
+    _total_documents: Optional[int] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Index all documents to OpenSearch index.
@@ -476,6 +499,8 @@ def index_documents(
     id_keys : List[str], optional
         list of keys that compound document unique id. If not provided will use `_id` key if exists,
         otherwise will generate unique identifier for each document.
+    transform_func: Callable, optional
+        function to be executed for each document. Used to create derived fields or to modify existing fields
     ignore_status:  Union[List[Any], Tuple[Any]], optional
         list of HTTP status codes that you want to ignore (not raising an exception)
     bulk_size: int,
@@ -516,13 +541,22 @@ https://opendistro.github.io/for-elasticsearch-docs/docs/elasticsearch/rest-api-
     ...     index='sample-index1'
     ... )
     """
-    if not isinstance(documents, list):
-        documents = list(documents)
-    total_documents = len(documents)
-    _logger.debug("indexing %s documents into %s", total_documents, index)
+
+    if _total_documents is None:
+        if not isinstance(documents, list):
+            documents = list(documents)
+        _total_documents = len(documents)
+
+    _logger.debug("indexing %s documents into %s", _total_documents, index)
 
     actions = _actions_generator(
-        documents, index, doc_type, keys_to_write=keys_to_write, id_keys=id_keys, bulk_size=bulk_size
+        documents,
+        index,
+        doc_type,
+        keys_to_write=keys_to_write,
+        id_keys=id_keys,
+        transform_func=transform_func,
+        bulk_size=bulk_size,
     )
 
     success = 0
@@ -535,7 +569,7 @@ https://opendistro.github.io/for-elasticsearch-docs/docs/elasticsearch/rest-api-
             progressbar.Bar(),
             progressbar.Timer(),
         ]
-        progress_bar = progressbar.ProgressBar(widgets=widgets, max_value=total_documents, prefix="Indexing: ").start()
+        progress_bar = progressbar.ProgressBar(widgets=widgets, max_value=_total_documents, prefix="Indexing: ").start()
         for i, bulk_chunk_documents in enumerate(actions):
             if i == 1:  # second bulk iteration, in case the index didn't exist before
                 refresh_interval = _get_refresh_interval(client, index)
@@ -555,7 +589,7 @@ https://opendistro.github.io/for-elasticsearch-docs/docs/elasticsearch/rest-api-
             )
             success += _success
             errors += _errors  # type: ignore
-            _logger.debug("indexed %s documents (%s/%s)", _success, success, total_documents)
+            _logger.debug("indexed %s documents (%s/%s)", _success, success, _total_documents)
             progress_bar.update(success, force=True)
     except TransportError as e:
         if str(e.status_code) == "429":  # Too Many Requests
@@ -567,6 +601,7 @@ https://opendistro.github.io/for-elasticsearch-docs/docs/elasticsearch/rest-api-
             raise e
 
     finally:
-        _set_refresh_interval(client, index, refresh_interval)
+        if refresh_interval:
+            _set_refresh_interval(client, index, refresh_interval)
 
     return {"success": success, "errors": errors}
